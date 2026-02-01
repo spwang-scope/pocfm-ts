@@ -235,12 +235,12 @@ class StockDataset(Dataset):
                 with open(scaler_path, 'rb') as f:
                     self.scaler = pickle.load(f)
                 print(f"Scaler loaded from {scaler_path}")
-            self.scaler.fit(stock_data[t_start:t_end].transpose(0, 2, 1).reshape(-1, self.N_indicator))
+            self.scaler.transform(stock_data[t_start:t_end].transpose(0, 2, 1).reshape(-1, self.N_indicator))
         elif mode == 'standalone':   # outside dataset (future data)
             # fit whole input for standalone prediction
             from sklearn.preprocessing import StandardScaler
             self.scaler = StandardScaler()
-            self.scaler.fit(stock_data[t_start:t_end].transpose(0, 2, 1).reshape(-1, self.N_indicator))
+            self.scaler.fit_transform(stock_data[t_start:t_end].transpose(0, 2, 1).reshape(-1, self.N_indicator))
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -288,7 +288,7 @@ class StockDataset(Dataset):
         x_obs = self.stock_data[t:t + self.seq_len, :, stock_idx]
         x_tar = self.stock_data[t + self.seq_len:t + self.total_len, :, stock_idx]
         c = self.cond_data[t:t + self.seq_len, :]
-
+        
         return (
             torch.from_numpy(x_obs),
             torch.from_numpy(x_tar),
@@ -297,58 +297,40 @@ class StockDataset(Dataset):
     
     def inverse_transform_stock_data(self, scaled_data):
         """
-        Inverse transform scaled stock data back to original scale.
-        
-        Args:
-            scaled_data: Scaled data with shape:
-                        - [T, N_indicator, N_stocks] for full stock data
-                        - [batch, seq_len, N_indicator] for model predictions (single stock)
-        
-        Returns:
-            Data in original scale with same shape as input
+        Inverse transform that only used in standalone prediction mode.
         """
         original_shape = scaled_data.shape
-        
+
+        # temporarily broken warning
+
+        # Backup original mean in self.scaler
+        original_mean = self.scaler.mean_
+
+        # select indicator axis
         if len(original_shape) == 3:
-            dim0, dim1, dim2 = original_shape
-            
-            # Detect which format based on dimensions
-            # If dim1 == N_indicator and dim2 == N_stocks: full stock data [T, N_indicator, N_stocks]
-            # If dim2 == N_indicator: model predictions [batch, seq_len, N_indicator]
-            
-            if dim2 == self.N_indicator:
-                # Model predictions: [batch, seq_len, N_indicator]
-                # Reshape: [batch, seq_len, N_indicator] -> [batch * seq_len, N_indicator]
-                scaled_2d = scaled_data.reshape(-1, self.N_indicator)
-                
-                # Inverse transform
-                original_2d = self.scaler.inverse_transform(scaled_2d)
-                
-                # Reshape back: [batch * seq_len, N_indicator] -> [batch, seq_len, N_indicator]
-                original_data = original_2d.reshape(dim0, dim1, self.N_indicator)
-            
-            elif dim1 == self.N_indicator:
-                # Full stock data: [T, N_indicator, N_stocks]
-                # Transpose: [T, N_indicator, N_stocks] -> [T, N_stocks, N_indicator]
-                # Reshape:   [T, N_stocks, N_indicator] -> [T * N_stocks, N_indicator]
-                scaled_2d = scaled_data.transpose(0, 2, 1).reshape(-1, self.N_indicator)
-                
-                # Inverse transform
-                original_2d = self.scaler.inverse_transform(scaled_2d)
-                
-                # Reshape back: [T * N_stocks, N_indicator] -> [T, N_stocks, N_indicator]
-                # Transpose back: [T, N_stocks, N_indicator] -> [T, N_indicator, N_stocks]
-                original_data = original_2d.reshape(dim0, dim2, self.N_indicator).transpose(0, 2, 1)
-            
-            else:
-                raise ValueError(f"Cannot determine data format from shape {original_shape}")
-            
+            # indicators for stocks data at axis=1
+            x_obs_last = scaled_data[:, -1]  # last observed value for anchoring
+            self.scaler.mean_ = x_obs_last
         elif len(original_shape) == 2:
+            # standalone predictions: indicators at axis=1
+            x_obs_last = scaled_data[:, -1]  # last observed value for anchoring
+            self.scaler.mean_ = x_obs_last
+
+
+        # Get the column of indicators indices in dataset
+        
+        #scaled_data[indi].mean(axis=0)
+        
+        if len(original_shape) == 2:
             # Simple 2D case: [T, N_indicator] or [seq_len, N_indicator]
+            #full_scaled_data = torch.cat([x_obs, scaled_data], dim=0)
             original_data = self.scaler.inverse_transform(scaled_data)
         
         else:
             raise ValueError(f"Unexpected data shape: {original_shape}")
+        
+        # Restore original mean in self.scaler
+        self.scaler.mean_ = original_mean
         
         return original_data
 
@@ -799,12 +781,23 @@ def visualize_predictions(
     test_dataset = StockDataset(
         stock_data, cond_data,
         config.seq_len, config.pred_len,
-        mode='test'
+        mode='standalone'
     )
     
     fig, axes = plt.subplots(n_samples, 1, figsize=(12, 3 * n_samples))
     if n_samples == 1:
         axes = [axes]
+
+    from sklearn.preprocessing import StandardScaler
+    inverse_scaler = StandardScaler()
+    try:
+        # Open the file in read-binary mode ('rb')
+        with open(config.scaler_path, 'rb') as file:
+            # Load the object from the file
+            inverse_scaler = pickle.load(file)
+            print("Scaler successfully loaded.")
+    except Exception as e:
+        print("Error loading scaler:", e)
     
     with torch.no_grad():
         for i in range(n_samples):
@@ -818,27 +811,50 @@ def visualize_predictions(
             preds = []
             for _ in range(10):
                 pred = model.sample(x_obs, c)
-                pred = test_dataset.inverse_transform_stock_tensor(pred)
+                pred = test_dataset.scaler.inverse_transform(pred.squeeze(0).cpu().numpy())
                 preds.append(pred)
-            preds = np.concatenate(preds, axis=0)  # [10, pred_len, n_features]
+            preds = np.array(preds)
+            #print(f"Inputs shape: {x_obs.shape}")
+            #print(f"Predictions shape: {preds.shape}")
+            assert preds.shape[-2:] == x_obs.shape[-2:] # [generated_predictions, pred_len, n_Indicator]
+
+            # Renew standscaler for inverse transform
+            #preds_agg = preds.mean(dim=0, keepdim=True).squeeze(0)  # aggregate predictions
+            #print(f'Aggregated predictions shape: {preds_agg.shape}')
+            #full_x = torch.cat([x_obs, preds_agg], dim=-2) # [batch, seq_len + pred_len, n_Indicator]
+            #full_x = full_x.cpu().numpy()
+            #print('full_x shape:', full_x.shape)
             
-            # Plot first feature
-            feature_idx = 3 # close price
+
+            #inverse_scaler.fit(full_x.reshape(-1, full_x.shape[-1]))  
+            #inverse_scaler.mean_ = x_obs[:, -1,:].squeeze(0).cpu().numpy()  # Anchor to last observed value
+
+            #print('inverse_scaler.mean_ shape:', inverse_scaler.mean_.shape)
+            #print('inverse_scaler.scale_ shape:', inverse_scaler.scale_.shape)
+            #print(f'inverse_scaler.mean_: {inverse_scaler.mean_}')
+            #print(f'inverse_scaler.scale_: {inverse_scaler.scale_}')
+
+            
+            # Plot close price
+            feature_idx = 3 
             ax = axes[i]
             
             # Observed
-            reversed_x_obs = test_dataset.inverse_transform_stock_tensor(x_obs.cpu())
+            reversed_x_obs = inverse_scaler.inverse_transform(x_obs.squeeze(1)[0,:,:].squeeze(0).cpu().numpy())
             t_obs = np.arange(config.seq_len)
-            ax.plot(t_obs, reversed_x_obs[0, :, feature_idx], 
+            ax.plot(t_obs, reversed_x_obs[:, feature_idx], 
                    'b-', label='Observed', linewidth=2)
             
             # Target
-            reversed_x_tar = test_dataset.inverse_transform_stock_tensor(x_tar)
+            reversed_x_tar = inverse_scaler.inverse_transform(x_tar.cpu().numpy())
             t_tar = np.arange(config.seq_len, config.seq_len + config.pred_len)
             ax.plot(t_tar, reversed_x_tar[:, feature_idx], 
                    'g-', label='Ground Truth', linewidth=2)
             
             # Predictions
+            #print(f'preds[0].squeeze(0).cpu().numpy() before inverse transform: {preds[0].squeeze(0).cpu().numpy().shape}')
+            #reversed_preds = inverse_scaler.inverse_transform(preds[0]) # collapse generated_predictions and batch
+            #print(f'reversed_preds shape: {reversed_preds.shape}')
             pred_mean = preds.mean(axis=0)[:, feature_idx]
             pred_std = preds.std(axis=0)[:, feature_idx]
             
@@ -848,7 +864,7 @@ def visualize_predictions(
             
             ax.axvline(x=config.seq_len - 0.5, color='gray', linestyle=':', alpha=0.5)
             ax.set_xlabel('Time')
-            ax.set_ylabel('Value')
+            ax.set_ylabel('Value of column index ' + str(feature_idx))
             ax.set_title(f'Sample {i + 1}')
             ax.legend(loc='upper right')
             ax.grid(True, alpha=0.3)
@@ -904,7 +920,7 @@ def main():
         n_steps=60,
         learning_rate=1e-4,
         batch_size=128,
-        train_epochs=50,
+        train_epochs=1,
         use_gpu=True,
         #using_train_exp: Set patience for early stopping
         patience=10,
@@ -928,11 +944,11 @@ def main():
     cond_data = pd.read_csv('metamarket-20200101-20251231.csv').to_numpy().astype(np.float32)
     print(f"   Condition data shape: {cond_data.shape}")
     stock_data = np.nan_to_num(stock_data, copy=False, posinf=10.0, neginf=-10.0)
-    print(np.isnan(stock_data).any())
-    print(np.isinf(stock_data).any())
-
-    print(np.isnan(cond_data).any())
-    print(np.isinf(cond_data).any())
+    isnan = np.isnan(stock_data).any() or np.isinf(stock_data).any() or np.isnan(cond_data).any() or np.isinf(cond_data).any()
+    if isnan:
+        raise ValueError(f"    Input data contains NaN or Inf values.")
+    else:
+        print(f"    Input data contains no NaN or Inf values.")
 
     #using_train_exp: Ensure save directories exist
     os.makedirs(config.save_path, exist_ok=True)
@@ -943,11 +959,7 @@ def main():
     print("\n2. Training PO-CFM model...")
     model, train_losses, val_losses, scaler = train_model(
         config, stock_data, cond_data
-    )
-    with open(config.scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f"    Training split scaler saved to {config.scaler_path}")
-    
+    )    
     # Evaluate on test set
     print("\n3. Evaluating on test set...")
     device = torch.device(f'cuda:0' if config.use_gpu else 'cpu')
@@ -982,7 +994,7 @@ def main():
     test_dataset = StockDataset(
         selected_stock_data, cond_data,
         config.seq_len, config.pred_len,
-        mode='test'
+        mode='standalone'
     )
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
     visualize_predictions(model, selected_stock_data, cond_data, config, n_samples=20, save_path=config.save_path + 'pocfm_selected_stock_predictions.png')

@@ -412,8 +412,9 @@ class Model(nn.Module):
         # Sample noise z_0 ~ N(0, I)
         #z_0 = torch.randn_like(x_tar)
         last_value = x_obs[:, -1:, :].expand(-1, self.pred_len, -1)  # [B, pred_len, n_features]
-        noise_scale = 0.5
-        z_0 = (1-noise_scale) * last_value + noise_scale * torch.randn_like(last_value)
+        #noise_scale = 0.5
+        #z_0 = (1-noise_scale) * last_value + noise_scale * torch.randn_like(last_value)
+        z_0 = last_value
         
         # OT interpolation: x_t = (1-t) * z_0 + t * x_tar
         t_expanded = t.view(batch_size, 1, 1)  # [B, 1, 1]
@@ -427,9 +428,12 @@ class Model(nn.Module):
         v_pred = self.velocity(x_t, t, h_cond)
         v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=1, neginf=-1)
         assert not torch.isnan(v_pred).any(), "Predicted velocity is NaN!"
+
+        # Penalty loss:Enforce boundary value of close
+        # violation=max(0,0.9*torch.abs(x_t[:, -1, 2] - x_tar[:, 0, 2]).mean().item())+max(0,1.1*torch.abs(x_t[:, -1, 2] - x_tar[:, -1, 2]).mean().item())
         
         # Flow matching loss
-        loss = F.mse_loss(v_pred, u_t)
+        loss = F.mse_loss(v_pred, u_t) # + 2*violation #+ 0.1*F.mse_loss(x_t[:, -1, :], x_tar[:, -1, :]) 
         
         metrics = {
             'loss': loss.item(),
@@ -468,19 +472,21 @@ class Model(nn.Module):
         # Encode context
         h_cond = self.encoder(x_obs, c, mask)
         
-        # Initialize from noise + last observed value
-        #x_t = torch.randn(batch_size, self.pred_len, self.n_features, device=device) + x_obs[:, -1:, :]
-        last_value = x_obs[:, -1:, :].expand(-1, self.pred_len, -1)  # [B, pred_len, n_features]
-        noise_scale = 0.5
-        x_t = (1-noise_scale) * last_value + noise_scale * torch.randn_like(last_value)
+        # Initialize from noise
+        x_t = torch.randn(batch_size, self.pred_len, self.n_features, device=device)
+
+        # x_obs statstics for denormalization
+        #x_obs_stdev = torch.sqrt(torch.var(x_obs, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        #x_obs_end = x_obs[:, -1:, :]
         
         # Euler integration from t=0 to t=1
-        dt = 1.0 / n_steps
+        dt = 1.0 / n_steps # scale timestep to [0,1]
         for i in range(n_steps):
             t = torch.full((batch_size,), i * dt, device=device)
             v = self.velocity(x_t, t, h_cond)
             x_t = x_t + dt * v
-            
+             
+
         return x_t
     
     def forward(
