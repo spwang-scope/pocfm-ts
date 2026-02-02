@@ -473,7 +473,7 @@ class Model(nn.Module):
         h_cond = self.encoder(x_obs, c, mask)
         
         # Initialize from noise
-        x_t = torch.randn(batch_size, self.pred_len, self.n_features, device=device)
+        x_t = x_obs[:, -1:, :] + torch.randn(batch_size, self.pred_len, self.n_features, device=device)
 
         # x_obs statstics for denormalization
         #x_obs_stdev = torch.sqrt(torch.var(x_obs, dim=1, keepdim=True, unbiased=False) + 1e-5)

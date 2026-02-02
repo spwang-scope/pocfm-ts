@@ -13,6 +13,7 @@ The model learns to predict future stock indicators given:
 2. Market-wide condition data (e.g., indices, sentiment)
 """
 
+#from networkx import config
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -231,16 +232,26 @@ class StockDataset(Dataset):
                 pickle.dump(self.scaler, f)
             print(f"Scaler saved to {scaler_path}")
         elif (mode == 'test') or (mode == 'val'):    # within dataset
-            if os.path.exists(scaler_path):
-                with open(scaler_path, 'rb') as f:
-                    self.scaler = pickle.load(f)
-                print(f"Scaler loaded from {scaler_path}")
+            try:
+                # Open the file in read-binary mode ('rb')
+                with open(scaler_path, 'rb') as file:
+                    # Load the object from the file
+                    self.scaler = pickle.load(file)
+                    print("Scaler successfully loaded.")
+            except Exception as e:
+                print("Error loading scaler:", e)
             self.scaler.transform(stock_data[t_start:t_end].transpose(0, 2, 1).reshape(-1, self.N_indicator))
         elif mode == 'standalone':   # outside dataset (future data)
             # fit whole input for standalone prediction
-            from sklearn.preprocessing import StandardScaler
-            self.scaler = StandardScaler()
-            self.scaler.fit_transform(stock_data[t_start:t_end].transpose(0, 2, 1).reshape(-1, self.N_indicator))
+            try:
+                # Open the file in read-binary mode ('rb')
+                with open(scaler_path, 'rb') as file:
+                    # Load the object from the file
+                    self.scaler = pickle.load(file)
+                    print("Scaler successfully loaded.")
+            except Exception as e:
+                print("Error loading scaler:", e)
+            self.scaler.transform(stock_data[t_start:t_end].transpose(0, 2, 1).reshape(-1, self.N_indicator))
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -838,6 +849,9 @@ def visualize_predictions(
             # Plot close price
             feature_idx = 3 
             ax = axes[i]
+
+            ax.set_xlim(-5, 65)
+            ax.set_ylim(-5, 400)
             
             # Observed
             reversed_x_obs = inverse_scaler.inverse_transform(x_obs.squeeze(1)[0,:,:].squeeze(0).cpu().numpy())
@@ -913,14 +927,14 @@ def main():
         n_cond_features=10,    # Market conditions
         d_model=128,
         n_heads=4,
-        e_layers=2,
-        d_layers=3,
+        e_layers=4,
+        d_layers=4,
         d_ff=128,
         dropout=0.1,
-        n_steps=60,
+        n_steps=100,
         learning_rate=1e-4,
         batch_size=128,
-        train_epochs=1,
+        train_epochs=50,
         use_gpu=True,
         #using_train_exp: Set patience for early stopping
         patience=10,
