@@ -33,6 +33,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from POCFM import Model, ContextEncoder, VelocityNetwork
 
+np.random.seed(9487)
+torch.manual_seed(9487)
 
 # =============================================================================
 # Configuration
@@ -124,7 +126,6 @@ def generate_dummy_stock_data(
         stock_data: [T_total, N_stocks, N_indicator]
         cond_data: [T_total, N_cond_indicator]
     """
-    np.random.seed(42)
     t = np.linspace(0, 10 * np.pi, T_total)
     
     # Generate market-wide factors (conditions)
@@ -233,7 +234,6 @@ class StockDataset(Dataset):
             print(f"Scaler saved to {scaler_path}")
         elif (mode == 'test') or (mode == 'val'):    # within dataset
             try:
-                # Open the file in read-binary mode ('rb')
                 with open(scaler_path, 'rb') as file:
                     # Load the object from the file
                     self.scaler = pickle.load(file)
@@ -244,7 +244,6 @@ class StockDataset(Dataset):
         elif mode == 'standalone':   # outside dataset (future data)
             # fit whole input for standalone prediction
             try:
-                # Open the file in read-binary mode ('rb')
                 with open(scaler_path, 'rb') as file:
                     # Load the object from the file
                     self.scaler = pickle.load(file)
@@ -273,12 +272,11 @@ class StockDataset(Dataset):
         self.samples = []
         for t in range(0, T - self.total_len + 1, stride):
             for stock_idx in range(self.N_stocks):
-                sample_seq = self.stock_data[t:t + self.seq_len, :, stock_idx]
+                sample_seq = self.stock_data[t:t + self.seq_len, :, stock_idx]  # [seq_len, N_indicator]
                 zero_seq = (not (sample_seq[0] - sample_seq[-1]).any() or sample_seq[0].sum() == 0 or sample_seq[-1].sum() == 0)
-                activities = (sample_seq.max() - sample_seq[0]) / (sample_seq.max() - sample_seq.min() + 1e-5) > 0.01
-                activity = activities.any()
+                activities = np.abs(sample_seq[:,2].max() - sample_seq[:,2].min()) / ( sample_seq[:,2].min() + 1e-5) > 0.2
                 volatilities = self.compute_volatility(sample_seq)
-                if not zero_seq and activity:
+                if not zero_seq and activities:
                     
                     if mode == 'standalone' or mode == 'test':
                         if volatilities.max() > 1:   # threshold for volatility
@@ -780,6 +778,7 @@ def visualize_predictions(
     model: Model,
     stock_data: np.ndarray,
     cond_data: np.ndarray,
+    test_dataset: StockDataset,
     config: Config,
     n_samples: int = 5,
     save_path: Optional[str] = None
@@ -788,12 +787,7 @@ def visualize_predictions(
     device = torch.device(f'cuda:0' if config.use_gpu else 'cpu')
     model.eval()
     
-    # Create test dataset
-    test_dataset = StockDataset(
-        stock_data, cond_data,
-        config.seq_len, config.pred_len,
-        mode='standalone'
-    )
+    
     
     fig, axes = plt.subplots(n_samples, 1, figsize=(12, 3 * n_samples))
     if n_samples == 1:
@@ -817,17 +811,25 @@ def visualize_predictions(
             
             x_obs = x_obs.unsqueeze(0).to(device)
             c = c.unsqueeze(0).to(device)
+
+            assert not x_obs[:, 0, :].sum() == x_obs[:, -1, :].sum()  # sanity check
+
             
             # Generate multiple predictions
             preds = []
             for _ in range(10):
                 pred = model.sample(x_obs, c)
-                pred = test_dataset.scaler.inverse_transform(pred.squeeze(0).cpu().numpy())
+                assert not pred[:, 0, :].sum() == pred[:, -1, :].sum()  # sanity check
+                assert not pred[:, 0, :].sum() == x_obs[:, 0, :].sum()
+                pred = inverse_scaler.inverse_transform(pred.squeeze(0).cpu().numpy())
+                
                 preds.append(pred)
             preds = np.array(preds)
             #print(f"Inputs shape: {x_obs.shape}")
             #print(f"Predictions shape: {preds.shape}")
             assert preds.shape[-2:] == x_obs.shape[-2:] # [generated_predictions, pred_len, n_Indicator]
+
+            #print(preds[0,:,3])
 
             # Renew standscaler for inverse transform
             #preds_agg = preds.mean(dim=0, keepdim=True).squeeze(0)  # aggregate predictions
@@ -847,14 +849,16 @@ def visualize_predictions(
 
             
             # Plot close price
-            feature_idx = 3 
+            feature_idx = 2
             ax = axes[i]
 
             ax.set_xlim(-5, 65)
-            ax.set_ylim(-5, 400)
+            ax.set_ylim(bottom=10, top=1000)
             
             # Observed
+            #print(x_obs.squeeze(1)[0,:,:].squeeze(0).cpu().numpy())
             reversed_x_obs = inverse_scaler.inverse_transform(x_obs.squeeze(1)[0,:,:].squeeze(0).cpu().numpy())
+            #print(f'reversed_x_obs[:, feature_idx]: {reversed_x_obs[:, feature_idx]}')
             t_obs = np.arange(config.seq_len)
             ax.plot(t_obs, reversed_x_obs[:, feature_idx], 
                    'b-', label='Observed', linewidth=2)
@@ -917,7 +921,7 @@ def main():
     print("=" * 60)
     print("Partially Observable Conditional Flow Matching (PO-CFM)")
     print("=" * 60)
-    
+
     # Configuration
     #using_train_exp: Added patience and checkpoints to config
     config = Config(
@@ -929,21 +933,20 @@ def main():
         n_heads=4,
         e_layers=4,
         d_layers=4,
-        d_ff=128,
+        d_ff=256,
         dropout=0.1,
-        n_steps=100,
-        learning_rate=1e-4,
+        n_steps=400,
+        learning_rate=1e-5,
         batch_size=128,
-        train_epochs=50,
+        train_epochs=40,
         use_gpu=True,
         #using_train_exp: Set patience for early stopping
-        patience=10,
+        patience=5,
         #using_train_exp: Set checkpoints directory
         checkpoints='./checkpoints/'
     )
     
-    # Generate dummy data
-    print("\n1. Generating dummy stock data...")
+    print("\n1. Loading data...")
     # stock_data, cond_data = generate_dummy_stock_data(
     #     T_total=1000,
     #     N_stocks=20,
@@ -952,17 +955,19 @@ def main():
     #     noise_level=0.1
     # )
 
-    stock_data = np.float32(np.load('20200101-20251231.npy').astype(np.float32))  # [T, N_indicator, N_stocks]
-
+    stock_data = np.float32(np.load('2020-01-01-2025-05-31-95perT.npy').astype(np.float32))  # [T, N_indicator, N_stocks]
     print(f"   Stock data shape: {stock_data.shape}")
-    cond_data = pd.read_csv('metamarket-20200101-20251231.csv').to_numpy().astype(np.float32)
+    cond_data = pd.read_csv('metamarket-20200101-20250531.csv').to_numpy().astype(np.float32)
     print(f"   Condition data shape: {cond_data.shape}")
+    
+
+    
     stock_data = np.nan_to_num(stock_data, copy=False, posinf=10.0, neginf=-10.0)
     isnan = np.isnan(stock_data).any() or np.isinf(stock_data).any() or np.isnan(cond_data).any() or np.isinf(cond_data).any()
     if isnan:
         raise ValueError(f"    Input data contains NaN or Inf values.")
     else:
-        print(f"    Input data contains no NaN or Inf values.")
+        print(f"   Input data contains no NaN or Inf values.")
 
     #using_train_exp: Ensure save directories exist
     os.makedirs(config.save_path, exist_ok=True)
@@ -971,9 +976,12 @@ def main():
     # Train model
     #using_train_exp: train_model now uses Exp_POCFM_Custom.train() internally
     print("\n2. Training PO-CFM model...")
+    
     model, train_losses, val_losses, scaler = train_model(
         config, stock_data, cond_data
-    )    
+    )
+    device = next(model.parameters()).device
+
     # Evaluate on test set
     print("\n3. Evaluating on test set...")
     device = torch.device(f'cuda:0' if config.use_gpu else 'cpu')
@@ -990,17 +998,19 @@ def main():
     print(f"   Test MAE: {test_mae:.6f}")
     
     # Visualize
-    print("\n4. Visualizing predictions...")
+    print("\n4. Visualizing losses history...")
     #using_train_exp: Plot training curves from exp training
     if train_losses and val_losses:
         plot_training_curves(train_losses, val_losses, 
                              save_path=config.save_path + 'training_curves.png')
     
     
-    visualize_predictions(model, stock_data, cond_data, config, n_samples=20, save_path=config.save_path + 'pocfm_stock_predictions.png')
+    # visualize_predictions(model, stock_data, cond_data, config, n_samples=20, save_path=config.save_path + 'pocfm_stock_predictions.png')
 
-    selected_stock_name = ['2330', '2317', '2359', '3450', '3081', '2609', '3231', '3706', '6533']
-    selected_stock_idx = np.array([795, 786, 819, 1334, 1190, 979, 1251, 1471, 2151])
+    ticker_index_map = pickle.load(open('ticker_index_dict.pkl', 'rb'))
+    inverted_dict = {v: k for k, v in ticker_index_map.items()}
+    selected_stock_ticker = ['4763', '8422', '6919', '8021', '2408', '0052', '2344', '6949', '8210', '8110']
+    selected_stock_idx = [inverted_dict[ticker] for ticker in selected_stock_ticker]
     selected_stock_data = stock_data[:, :, selected_stock_idx]
     
     # standalone test on selected stocks
@@ -1011,11 +1021,27 @@ def main():
         mode='standalone'
     )
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
-    visualize_predictions(model, selected_stock_data, cond_data, config, n_samples=20, save_path=config.save_path + 'pocfm_selected_stock_predictions.png')
+    visualize_predictions(model, selected_stock_data, cond_data,test_dataset, config, n_samples=20, save_path=config.save_path + 'pocfm_selected_stock_predictions.png')
     _, test_mse, test_mae = evaluate(model, test_loader, device)
     print(f"   Test MSE: {test_mse:.6f}")
     print(f"   Test MAE: {test_mae:.6f}")
 
+    print("\n6. Evaluating on out-of-sample time windows...")
+    outtime_stock_data = np.float32(np.load('2025-06-01-2025-12-31-95perT.npy').astype(np.float32))  # [T, N_indicator, N_stocks]
+    print(f"   Stock data shape: {outtime_stock_data.shape}")
+    cond_data = pd.read_csv('metamarket-20250601-20251231.csv').to_numpy().astype(np.float32)
+    print(f"   Condition data shape: {cond_data.shape}")
+
+    test_dataset = StockDataset(
+        outtime_stock_data, cond_data,
+        config.seq_len, config.pred_len,
+        mode='standalone'
+    )
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+    visualize_predictions(model, outtime_stock_data, cond_data,test_dataset, config, n_samples=20, save_path=config.save_path + 'pocfm_outtime_stock_predictions.png')
+    _, test_mse, test_mae = evaluate(model, test_loader, device)
+    print(f"   Test MSE: {test_mse:.6f}")
+    print(f"   Test MAE: {test_mae:.6f}")
     
     print("\n" + "=" * 60)
     print("Done!")

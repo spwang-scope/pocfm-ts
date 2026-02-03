@@ -340,9 +340,10 @@ class Model(nn.Module):
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.n_features = configs.enc_in  # Number of input features
+        self.d_model = getattr(configs, 'd_model', 128)
         self.n_cond_features = getattr(configs, 'n_cond_features', configs.enc_in)
         
-        d_model = getattr(configs, 'd_model', 128)
+        #d_model = getattr(configs, 'd_model', 128)
         n_heads = getattr(configs, 'n_heads', 4)
         e_layers = getattr(configs, 'e_layers', 2)
         d_layers = getattr(configs, 'd_layers', 3)
@@ -357,7 +358,7 @@ class Model(nn.Module):
         self.encoder = ContextEncoder(
             n_features=self.n_features,
             n_cond_features=self.n_cond_features,
-            d_model=d_model,
+            d_model=self.d_model,
             n_heads=n_heads,
             n_layers=e_layers,
             d_ff=d_ff,
@@ -368,13 +369,29 @@ class Model(nn.Module):
         # Velocity Network
         self.velocity = VelocityNetwork(
             n_features=self.n_features,
-            d_model=d_model,
+            d_model=self.d_model,
             n_heads=n_heads,
             n_layers=d_layers,
             d_ff=d_ff,
             dropout=dropout,
-            context_dim=d_model
+            context_dim=self.d_model
         )
+
+        self.v0encoder = ContextEncoder(
+            n_features=self.n_features,
+            n_cond_features=self.n_cond_features,
+            d_model=self.d_model,
+            n_heads=n_heads,
+            n_layers=e_layers,
+            d_ff=d_ff,
+            dropout=dropout,
+            aggregate='none'  # Keep sequence for cross-attention
+        )
+
+        # self.starting_speed = nn.Linear(self.n_features, self.n_features)
+
+        # nn.init.ones_(self.starting_speed.weight)
+        # nn.init.normal_(self.starting_speed.bias, mean=0.0, std=1.0)
         
     def compute_loss(
         self,
@@ -473,7 +490,8 @@ class Model(nn.Module):
         h_cond = self.encoder(x_obs, c, mask)
         
         # Initialize from noise
-        x_t = x_obs[:, -1:, :] + torch.randn(batch_size, self.pred_len, self.n_features, device=device)
+        x_t = x_obs[:, -1:, :] + self.velocity(x_obs[:, -1:, :], (1.0 / n_steps)*torch.ones(batch_size, device=device), h_cond)[-1] + torch.randn(batch_size, self.pred_len, self.n_features, device=device)
+        #x_t = torch.randn(batch_size, self.pred_len, self.n_features, device=device)
 
         # x_obs statstics for denormalization
         #x_obs_stdev = torch.sqrt(torch.var(x_obs, dim=1, keepdim=True, unbiased=False) + 1e-5)
