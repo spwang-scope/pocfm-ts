@@ -27,6 +27,7 @@ import pandas as pd
 import random
 import pickle
 from sklearn.preprocessing import StandardScaler
+from torchinfo import summary
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -80,6 +81,7 @@ class Config:
     ):
         self.seq_len = seq_len
         self.pred_len = pred_len
+        self.n_features = n_features
         self.enc_in = n_features
         self.n_cond_features = n_cond_features
         self.d_model = d_model
@@ -274,17 +276,19 @@ class StockDataset(Dataset):
             for stock_idx in range(self.N_stocks):
                 sample_seq = self.stock_data[t:t + self.seq_len, :, stock_idx]  # [seq_len, N_indicator]
                 zero_seq = (not (sample_seq[0] - sample_seq[-1]).any() or sample_seq[0].sum() == 0 or sample_seq[-1].sum() == 0)
-                activities = np.abs(sample_seq[:,2].max() - sample_seq[:,2].min()) / ( sample_seq[:,2].min() + 1e-5) > 0.2
+                #activities = np.abs(sample_seq[:,2].max() - sample_seq[:,2].min()) / ( sample_seq[:,2].min() + 1e-5) > 0.35
+                max_diff = np.abs(max(sample_seq[:,2]) - min(sample_seq[:,2]))
+                act = max_diff/min(sample_seq[:,2])
                 volatilities = self.compute_volatility(sample_seq)
-                if not zero_seq and activities:
+                if not zero_seq:
                     
-                    if mode == 'standalone' or mode == 'test':
-                        if volatilities.max() > 1:   # threshold for volatility
-                            self.samples.append((t, stock_idx))
-                    elif mode == 'train' or mode=='val':
-                        if volatilities.max() > 0.5:   # threshold for volatility
+                    if mode == 'standalone' or mode == 'test' or mode=='val':
+                        self.samples.append((t, stock_idx))
+                    elif mode == 'train':
+                        if (max_diff>10) or (act>0.3):   # threshold for volatility
                             self.samples.append((t, stock_idx))
         assert  (len(self.samples) > 0), 'No samples found for mode: {mode}'
+        print(f"Sample number under {mode}: {len(self.samples)}")
 
                 
     def __len__(self):
@@ -819,15 +823,14 @@ def visualize_predictions(
             preds = []
             for _ in range(10):
                 pred = model.sample(x_obs, c)
-                assert not pred[:, 0, :].sum() == pred[:, -1, :].sum()  # sanity check
+                #assert not pred[0, 0, :].sum() == pred[0, 0, :].sum()  # sanity check
                 assert not pred[:, 0, :].sum() == x_obs[:, 0, :].sum()
                 pred = inverse_scaler.inverse_transform(pred.squeeze(0).cpu().numpy())
                 
                 preds.append(pred)
             preds = np.array(preds)
-            #print(f"Inputs shape: {x_obs.shape}")
-            #print(f"Predictions shape: {preds.shape}")
-            assert preds.shape[-2:] == x_obs.shape[-2:] # [generated_predictions, pred_len, n_Indicator]
+            assert preds.shape[-2:] == x_obs.shape[-2:], f"Shape mismatch: {preds.shape} vs {x_obs.shape}"
+             # [generated_predictions, pred_len, n_Indicator]
 
             #print(preds[0,:,3])
 
@@ -852,8 +855,8 @@ def visualize_predictions(
             feature_idx = 2
             ax = axes[i]
 
-            ax.set_xlim(-5, 65)
-            ax.set_ylim(bottom=10, top=1000)
+            
+            
             
             # Observed
             #print(x_obs.squeeze(1)[0,:,:].squeeze(0).cpu().numpy())
@@ -875,7 +878,10 @@ def visualize_predictions(
             #print(f'reversed_preds shape: {reversed_preds.shape}')
             pred_mean = preds.mean(axis=0)[:, feature_idx]
             pred_std = preds.std(axis=0)[:, feature_idx]
-            
+
+            ax.set_xlim(-5, 65)
+            ax.set_ylim(bottom=10, top=1000)
+
             ax.plot(t_tar, pred_mean, 'r--', label='Prediction (mean)', linewidth=2)
             ax.fill_between(t_tar, pred_mean - 2*pred_std, pred_mean + 2*pred_std,
                           alpha=0.3, color='red', label='±2 std')
@@ -931,14 +937,14 @@ def main():
         n_cond_features=10,    # Market conditions
         d_model=128,
         n_heads=4,
-        e_layers=4,
-        d_layers=4,
+        e_layers=3,
+        d_layers=2,
         d_ff=256,
         dropout=0.1,
-        n_steps=400,
+        n_steps=200,
         learning_rate=1e-5,
         batch_size=128,
-        train_epochs=40,
+        train_epochs=30,
         use_gpu=True,
         #using_train_exp: Set patience for early stopping
         patience=5,
@@ -955,7 +961,7 @@ def main():
     #     noise_level=0.1
     # )
 
-    stock_data = np.float32(np.load('2020-01-01-2025-05-31-95perT.npy').astype(np.float32))  # [T, N_indicator, N_stocks]
+    stock_data = np.float32(np.load('2020-01-01-2025-05-31-637.npy').astype(np.float32))  # [T, N_indicator, N_stocks]
     print(f"   Stock data shape: {stock_data.shape}")
     cond_data = pd.read_csv('metamarket-20200101-20250531.csv').to_numpy().astype(np.float32)
     print(f"   Condition data shape: {cond_data.shape}")
@@ -1007,14 +1013,17 @@ def main():
     
     # visualize_predictions(model, stock_data, cond_data, config, n_samples=20, save_path=config.save_path + 'pocfm_stock_predictions.png')
 
-    ticker_index_map = pickle.load(open('ticker_index_dict.pkl', 'rb'))
-    inverted_dict = {v: k for k, v in ticker_index_map.items()}
-    selected_stock_ticker = ['4763', '8422', '6919', '8021', '2408', '0052', '2344', '6949', '8210', '8110']
-    selected_stock_idx = [inverted_dict[ticker] for ticker in selected_stock_ticker]
-    selected_stock_data = stock_data[:, :, selected_stock_idx]
+    
     
     # standalone test on selected stocks
-    print("\n5. Evaluating on selected stocks...")
+    print("\n5. Evaluating on selected voltile stocks...")
+
+    ticker_index_map = pickle.load(open('ticker_index_dict.pkl', 'rb'))
+    inverted_dict = {v: k for k, v in ticker_index_map.items()}
+    selected_stock_ticker = ['2603', '2359', '2408', '1301', '1513', '3037', '3450', '8210', '2382']
+    selected_stock_idx = [inverted_dict[ticker] for ticker in selected_stock_ticker]
+    selected_stock_data = stock_data[:, :, selected_stock_idx]
+
     test_dataset = StockDataset(
         selected_stock_data, cond_data,
         config.seq_len, config.pred_len,
@@ -1026,8 +1035,9 @@ def main():
     print(f"   Test MSE: {test_mse:.6f}")
     print(f"   Test MAE: {test_mae:.6f}")
 
-    print("\n6. Evaluating on out-of-sample time windows...")
-    outtime_stock_data = np.float32(np.load('2025-06-01-2025-12-31-95perT.npy').astype(np.float32))  # [T, N_indicator, N_stocks]
+    print("\n6. Evaluating on out-of-time windows...")
+
+    outtime_stock_data = np.float32(np.load('2025-06-01-2025-12-31-637.npy').astype(np.float32))  # [T, N_indicator, N_stocks]
     print(f"   Stock data shape: {outtime_stock_data.shape}")
     cond_data = pd.read_csv('metamarket-20250601-20251231.csv').to_numpy().astype(np.float32)
     print(f"   Condition data shape: {cond_data.shape}")
@@ -1042,10 +1052,30 @@ def main():
     _, test_mse, test_mae = evaluate(model, test_loader, device)
     print(f"   Test MSE: {test_mse:.6f}")
     print(f"   Test MAE: {test_mae:.6f}")
+
+    print("\n7. Evaluating on interested all stocks...")
+    interested_stock_ticker = ['2330', '6285', '3443', '2360']
+    interested_stock_idx = [inverted_dict[ticker] for ticker in interested_stock_ticker]
+    interested_stock_data = outtime_stock_data[:, :, interested_stock_idx] 
+    
+    test_dataset = StockDataset(
+        interested_stock_data, cond_data,
+        config.seq_len, config.pred_len,
+        mode='standalone'
+    )
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+    visualize_predictions(model, interested_stock_data, cond_data,test_dataset, config, n_samples=20, save_path=config.save_path + 'pocfm_interested_stock_predictions.png')
+    _, test_mse, test_mae = evaluate(model, test_loader, device)
+    print(f"   Test MSE: {test_mse:.6f}")
+    print(f"   Test MAE: {test_mae:.6f}")
+
+    
     
     print("\n" + "=" * 60)
     print("Done!")
     print("=" * 60)
+
+
 
 
 if __name__ == "__main__":

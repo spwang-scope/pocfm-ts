@@ -431,7 +431,9 @@ class Model(nn.Module):
         last_value = x_obs[:, -1:, :].expand(-1, self.pred_len, -1)  # [B, pred_len, n_features]
         #noise_scale = 0.5
         #z_0 = (1-noise_scale) * last_value + noise_scale * torch.randn_like(last_value)
-        z_0 = last_value
+        noise_scale = 0.9
+        z_0 =  self.velocity(x_obs[:, -1:, :], (1.0 / 2*self.n_steps)*torch.ones(batch_size, device=device), h_cond).expand(-1, self.pred_len, -1)
+        #print(f"z_0 shape at start of sampling: {z_0.shape}")
         
         # OT interpolation: x_t = (1-t) * z_0 + t * x_tar
         t_expanded = t.view(batch_size, 1, 1)  # [B, 1, 1]
@@ -485,18 +487,25 @@ class Model(nn.Module):
         n_steps = n_steps or self.n_steps
         batch_size = x_obs.shape[0]
         device = x_obs.device
-        
+
         # Encode context
         h_cond = self.encoder(x_obs, c, mask)
+
+        x_t =  self.velocity(x_obs[:, -1:, :], (1.0 / 2*n_steps)*torch.ones(batch_size, device=device), h_cond).expand(-1,self.pred_len, -1)
+        #print(f"x_t shape at start of sampling: {x_t.shape}")
+        
         
         # Initialize from noise
-        x_t = x_obs[:, -1:, :] + self.velocity(x_obs[:, -1:, :], (1.0 / n_steps)*torch.ones(batch_size, device=device), h_cond)[-1] + torch.randn(batch_size, self.pred_len, self.n_features, device=device)
+        #x_t = self.velocity(x_obs[:, -1:, :], (1.0 / n_steps)*torch.ones(batch_size, device=device), h_cond)[-1] + torch.randn(batch_size, self.pred_len, self.n_features, device=device)
         #x_t = torch.randn(batch_size, self.pred_len, self.n_features, device=device)
-
+        #print(f'x_t shape: {x_t.shape}')
+        #exit()
         # x_obs statstics for denormalization
         #x_obs_stdev = torch.sqrt(torch.var(x_obs, dim=1, keepdim=True, unbiased=False) + 1e-5)
         #x_obs_end = x_obs[:, -1:, :]
-        
+
+        assert x_t.shape[-2] == self.pred_len, f"Initial x_t has wrong sequence length: {x_t.shape[-2]} vs {self.pred_len}"
+
         # Euler integration from t=0 to t=1
         dt = 1.0 / n_steps # scale timestep to [0,1]
         for i in range(n_steps):
