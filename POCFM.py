@@ -256,12 +256,15 @@ class VelocityNetwork(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, n_features)
         )
+
+        self.last_value_proj = nn.Linear(n_features, d_model)
         
     def forward(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
-        h_cond: torch.Tensor
+        h_cond: torch.Tensor,
+        x_obs_last: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
@@ -291,6 +294,10 @@ class VelocityNetwork(nn.Module):
         h_cond = self.context_proj(h_cond)
         if h_cond.dim() == 2:
             h_cond = h_cond.unsqueeze(1)  # [B, 1, d_model]
+
+        x_obs_last = self.last_value_proj(x_obs_last).expand(-1, pred_len, -1)
+        x_obs_last = x_obs_last + t_emb
+        h_cond = torch.cat((x_obs_last, h_cond), 1)
         
         # Transformer layers with cross-attention
         for i in range(len(self.self_attn_layers)):
@@ -377,17 +384,6 @@ class Model(nn.Module):
             context_dim=self.d_model
         )
 
-        self.v0encoder = ContextEncoder(
-            n_features=self.n_features,
-            n_cond_features=self.n_cond_features,
-            d_model=self.d_model,
-            n_heads=n_heads,
-            n_layers=e_layers,
-            d_ff=d_ff,
-            dropout=dropout,
-            aggregate='none'  # Keep sequence for cross-attention
-        )
-
         # self.starting_speed = nn.Linear(self.n_features, self.n_features)
 
         # nn.init.ones_(self.starting_speed.weight)
@@ -426,14 +422,8 @@ class Model(nn.Module):
         # Sample flow time t ~ U(0, 1)
         t = torch.rand(batch_size, device=device)
         
-        # Sample noise z_0 ~ N(0, I)
-        #z_0 = torch.randn_like(x_tar)
-        last_value = x_obs[:, -1:, :].expand(-1, self.pred_len, -1)  # [B, pred_len, n_features]
-        #noise_scale = 0.5
-        #z_0 = (1-noise_scale) * last_value + noise_scale * torch.randn_like(last_value)
-        noise_scale = 0.9
-        z_0 =  self.velocity(x_obs[:, -1:, :], (1.0 / 2*self.n_steps)*torch.ones(batch_size, device=device), h_cond).expand(-1, self.pred_len, -1)
-        #print(f"z_0 shape at start of sampling: {z_0.shape}")
+        last_value = x_obs[:, -1:, :].expand(-1, self.pred_len, -1)
+        z_0 = last_value + 0.001 * torch.randn_like(last_value)
         
         # OT interpolation: x_t = (1-t) * z_0 + t * x_tar
         t_expanded = t.view(batch_size, 1, 1)  # [B, 1, 1]
@@ -444,7 +434,7 @@ class Model(nn.Module):
         
         # Predict velocity
         assert not torch.isnan(x_t).any(), "x_t is NaN!"
-        v_pred = self.velocity(x_t, t, h_cond)
+        v_pred = self.velocity(x_t, t, h_cond, x_obs[:, -1:, :])
         v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=1, neginf=-1)
         assert not torch.isnan(v_pred).any(), "Predicted velocity is NaN!"
 
@@ -491,8 +481,9 @@ class Model(nn.Module):
         # Encode context
         h_cond = self.encoder(x_obs, c, mask)
 
-        x_t =  self.velocity(x_obs[:, -1:, :], (1.0 / 2*n_steps)*torch.ones(batch_size, device=device), h_cond).expand(-1,self.pred_len, -1)
+        #x_t =  self.velocity(x_obs[:, -1:, :], (1.0 / 2*n_steps)*torch.ones(batch_size, device=device), h_cond).expand(-1,self.pred_len, -1)
         #print(f"x_t shape at start of sampling: {x_t.shape}")
+        x_t = x_obs[:, -1:, :].expand(-1, self.pred_len, -1).clone()
         
         
         # Initialize from noise
@@ -510,8 +501,24 @@ class Model(nn.Module):
         dt = 1.0 / n_steps # scale timestep to [0,1]
         for i in range(n_steps):
             t = torch.full((batch_size,), i * dt, device=device)
-            v = self.velocity(x_t, t, h_cond)
-            x_t = x_t + dt * v
+            #v = self.velocity(x_t, t, h_cond)
+            #x_t = x_t + dt * v
+            x_start = x_t
+            v1 = self.velocity(x_t, t, h_cond, x_obs[:, -1:, :])
+            if i < 0.15*n_steps:
+                v1 = v1*0.1
+            x_temp = x_t + dt * v1
+            v2 = self.velocity(x_temp, t + dt, h_cond, x_obs[:, -1:, :])
+            x_t = x_t + dt/2 * (v1 + v2)
+
+            
+
+            # clip x_t
+            if self.training:
+                if x_t>1.1*x_start:
+                    x_t = 1.1*x_start
+                elif x_t<0.9*x_start:
+                    x_t = 0.9*x_start
              
 
         return x_t

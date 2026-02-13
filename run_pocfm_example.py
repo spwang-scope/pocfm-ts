@@ -275,7 +275,7 @@ class StockDataset(Dataset):
         for t in range(0, T - self.total_len + 1, stride):
             for stock_idx in range(self.N_stocks):
                 sample_seq = self.stock_data[t:t + self.seq_len, :, stock_idx]  # [seq_len, N_indicator]
-                zero_seq = (not (sample_seq[0] - sample_seq[-1]).any() or sample_seq[0].sum() == 0 or sample_seq[-1].sum() == 0)
+                zero_seq = (not (sample_seq[0].all() == sample_seq[-1].all()) or sample_seq[0].sum() == 0 or sample_seq[-1].sum() == 0)
                 #activities = np.abs(sample_seq[:,2].max() - sample_seq[:,2].min()) / ( sample_seq[:,2].min() + 1e-5) > 0.35
                 max_diff = np.abs(max(sample_seq[:,2]) - min(sample_seq[:,2]))
                 act = max_diff/min(sample_seq[:,2])
@@ -285,7 +285,7 @@ class StockDataset(Dataset):
                     if mode == 'standalone' or mode == 'test' or mode=='val':
                         self.samples.append((t, stock_idx))
                     elif mode == 'train':
-                        if (max_diff>10) or (act>0.3):   # threshold for volatility
+                        #if (max_diff>10) or (act>0.1):   # threshold for volatility
                             self.samples.append((t, stock_idx))
         assert  (len(self.samples) > 0), 'No samples found for mode: {mode}'
         print(f"Sample number under {mode}: {len(self.samples)}")
@@ -580,6 +580,9 @@ class Exp_POCFM_Custom:
         
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
+
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f'Total number of parameters: {total_params}')
         return model
     
     def _get_data(self, flag):
@@ -613,7 +616,19 @@ class Exp_POCFM_Custom:
 
     def _select_optimizer(self):
         #using_train_exp: Same as Exp_POCFM._select_optimizer()
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        #model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+
+        velocity_params = set(map(id, self.model.velocity.parameters()))
+
+        other_params = [
+            p for p in self.model.parameters()
+            if id(p) not in velocity_params
+        ]
+
+        model_optim = torch.optim.Adam([
+            {"params": self.model.velocity.parameters(), "lr": self.args.learning_rate*2},
+            {"params": other_params, "lr": self.args.learning_rate}
+        ])
         return model_optim
 
     def _adapt_conditions(self, c):
@@ -683,10 +698,10 @@ class Exp_POCFM_Custom:
         best_vali_loss = float('inf')
 
         model_optim = self._select_optimizer()
-        
+
         # Learning rate scheduler
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            model_optim, mode='min', factor=0.5, patience=3
+            model_optim, mode='min', factor=0.5, patience=5
         )
 
         for epoch in range(self.args.train_epochs):
@@ -879,12 +894,11 @@ def visualize_predictions(
             pred_mean = preds.mean(axis=0)[:, feature_idx]
             pred_std = preds.std(axis=0)[:, feature_idx]
 
-            ax.set_xlim(-5, 65)
-            ax.set_ylim(bottom=10, top=1000)
+            ax.set_xlim(-5, config.seq_len+config.pred_len)
 
             ax.plot(t_tar, pred_mean, 'r--', label='Prediction (mean)', linewidth=2)
-            ax.fill_between(t_tar, pred_mean - 2*pred_std, pred_mean + 2*pred_std,
-                          alpha=0.3, color='red', label='±2 std')
+            #ax.fill_between(t_tar, pred_mean - 2*pred_std, pred_mean + 2*pred_std,
+            #              alpha=0.3, color='red', label='±2 std')
             
             ax.axvline(x=config.seq_len - 0.5, color='gray', linestyle=':', alpha=0.5)
             ax.set_xlabel('Time')
@@ -931,8 +945,8 @@ def main():
     # Configuration
     #using_train_exp: Added patience and checkpoints to config
     config = Config(
-        seq_len=30,
-        pred_len=30,
+        seq_len=60,
+        pred_len=60,
         n_features=6,          # Stock indicators
         n_cond_features=10,    # Market conditions
         d_model=128,
@@ -944,10 +958,10 @@ def main():
         n_steps=200,
         learning_rate=1e-5,
         batch_size=128,
-        train_epochs=30,
+        train_epochs=100,
         use_gpu=True,
         #using_train_exp: Set patience for early stopping
-        patience=5,
+        patience=10,
         #using_train_exp: Set checkpoints directory
         checkpoints='./checkpoints/'
     )
@@ -968,7 +982,6 @@ def main():
     
 
     
-    stock_data = np.nan_to_num(stock_data, copy=False, posinf=10.0, neginf=-10.0)
     isnan = np.isnan(stock_data).any() or np.isinf(stock_data).any() or np.isnan(cond_data).any() or np.isinf(cond_data).any()
     if isnan:
         raise ValueError(f"    Input data contains NaN or Inf values.")
@@ -982,7 +995,19 @@ def main():
     # Train model
     #using_train_exp: train_model now uses Exp_POCFM_Custom.train() internally
     print("\n2. Training PO-CFM model...")
+
+    # temp test of limiting stocks
+    # ticker_index_map = pickle.load(open('ticker_index_dict.pkl', 'rb'))
+    # inverted_dict = {v: k for k, v in ticker_index_map.items()}
+    # selected_stock_ticker = ['2603', '2359', '2408', '1301', '1513', '3037', '3450', '8210', '2382', '1513', '1519']
+    # selected_stock_idx = [inverted_dict[ticker] for ticker in selected_stock_ticker]
+    # selected_stock_data = stock_data[:, :, selected_stock_idx]
     
+    # model, train_losses, val_losses, scaler = train_model(
+    #     config, stock_data, cond_data
+    # )
+    # device = next(model.parameters()).device
+
     model, train_losses, val_losses, scaler = train_model(
         config, stock_data, cond_data
     )
@@ -1020,20 +1045,20 @@ def main():
 
     ticker_index_map = pickle.load(open('ticker_index_dict.pkl', 'rb'))
     inverted_dict = {v: k for k, v in ticker_index_map.items()}
-    selected_stock_ticker = ['2603', '2359', '2408', '1301', '1513', '3037', '3450', '8210', '2382']
-    selected_stock_idx = [inverted_dict[ticker] for ticker in selected_stock_ticker]
-    selected_stock_data = stock_data[:, :, selected_stock_idx]
+    # selected_stock_ticker = ['1513', '1519']
+    # selected_stock_idx = [inverted_dict[ticker] for ticker in selected_stock_ticker]
+    # selected_stock_data = stock_data[:, :, selected_stock_idx]
 
-    test_dataset = StockDataset(
-        selected_stock_data, cond_data,
-        config.seq_len, config.pred_len,
-        mode='standalone'
-    )
-    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
-    visualize_predictions(model, selected_stock_data, cond_data,test_dataset, config, n_samples=20, save_path=config.save_path + 'pocfm_selected_stock_predictions.png')
-    _, test_mse, test_mae = evaluate(model, test_loader, device)
-    print(f"   Test MSE: {test_mse:.6f}")
-    print(f"   Test MAE: {test_mae:.6f}")
+    # test_dataset = StockDataset(
+    #     selected_stock_data, cond_data,
+    #     config.seq_len, config.pred_len,
+    #     mode='standalone'
+    # )
+    # test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+    # visualize_predictions(model, selected_stock_data, cond_data,test_dataset, config, n_samples=20, save_path=config.save_path + 'pocfm_selected_stock_predictions.png')
+    # _, test_mse, test_mae = evaluate(model, test_loader, device)
+    # print(f"   Test MSE: {test_mse:.6f}")
+    # print(f"   Test MAE: {test_mae:.6f}")
 
     print("\n6. Evaluating on out-of-time windows...")
 
@@ -1054,7 +1079,7 @@ def main():
     print(f"   Test MAE: {test_mae:.6f}")
 
     print("\n7. Evaluating on interested all stocks...")
-    interested_stock_ticker = ['2330', '6285', '3443', '2360']
+    interested_stock_ticker = ['1513','1519']
     interested_stock_idx = [inverted_dict[ticker] for ticker in interested_stock_ticker]
     interested_stock_data = outtime_stock_data[:, :, interested_stock_idx] 
     
